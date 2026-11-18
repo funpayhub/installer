@@ -1,0 +1,165 @@
+# Builds the installer for Windows (.exe) and Linux (.AppImage) and publishes them as a GitHub release.
+#
+# Run it by hand from the Actions tab. The version comes from pyproject.toml: version x.y.z is released
+# as tag vx.y.z on the commit the workflow runs on. If that tag already exists the run fails, so bump the
+# version first.
+
+name: Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  # PyInstaller doesnt work with uv python.
+  UV_PYTHON_PREFERENCE: only-system
+  UV_PYTHON_DOWNLOADS: never
+  APPIMAGETOOL_URL: https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+  APPIMAGETOOL_SHA256: ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
+
+jobs:
+  version:
+    name: Check version
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read version from pyproject.toml
+        id: version
+        run: |
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Version '$version' in pyproject.toml is not in x.y.z format"
+            exit 1
+          fi
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "Releasing v$version"
+
+      - name: Fail if the tag already exists
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          rc=0
+          git ls-remote --exit-code --tags origin "refs/tags/$TAG" > /dev/null || rc=$?
+          case "$rc" in
+            0) echo "::error::Tag $TAG already exists. Bump the version in pyproject.toml"; exit 1 ;;
+            2) echo "Tag $TAG is free" ;;
+            *) echo "::error::Could not list the tags of the repository (git exit code $rc)"; exit 1 ;;
+          esac
+
+  windows:
+    name: Build .exe
+    needs: version
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version-file: .python-version
+
+      - uses: astral-sh/setup-uv@v10.3.3
+
+      - name: Build
+        run: uv run --group build build.py
+
+      - name: Check that it starts
+        shell: pwsh
+        run: |
+          $process = Start-Process -FilePath dist/dothub-installer.exe -PassThru
+          Start-Sleep -Seconds 10
+          if ($process.HasExited) {
+            Write-Error "The installer exited right after start, exit code $($process.ExitCode)"
+            exit 1
+          }
+          Stop-Process -Id $process.Id -Force
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows
+          path: dist/dothub-installer.exe
+          if-no-files-found: error
+
+  linux:
+    name: Build .AppImage
+    needs: version
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version-file: .python-version
+      - uses: astral-sh/setup-uv@v10.3.3
+
+      - name: Install Qt system libraries
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends \
+            libegl1 libgl1 libfontconfig1 libdbus-1-3 libxkbcommon0 libxkbcommon-x11-0 \
+            libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 \
+            libxcb-shape0 libxcb-xinerama0 libxcb-xkb1 libwayland-client0 libwayland-cursor0 libwayland-egl1
+
+      - name: Build
+        env:
+          QT_QPA_PLATFORM: offscreen  # build.py draws the icon, and there is no display here
+        run: uv run --group build build.py
+
+      - name: Check that it starts
+        run: |
+          rc=0
+          QT_QPA_PLATFORM=offscreen timeout 15 dist/dothub-installer || rc=$?
+          if [ "$rc" != 124 ]; then
+            echo "::error::The installer exited right after start, exit code $rc"
+            exit 1
+          fi
+
+      - name: Pack AppImage
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/appimagetool" "$APPIMAGETOOL_URL"
+          echo "$APPIMAGETOOL_SHA256  $RUNNER_TEMP/appimagetool" | sha256sum --check --strict
+          chmod +x "$RUNNER_TEMP/appimagetool"
+          bash .github/scripts/build-appimage.sh "$RUNNER_TEMP/appimagetool"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux
+          path: dist/dothub-installer-x86_64.AppImage
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [version, windows, linux]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          # checked again: another run could have created the tag while this one was building
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --silent 2> /dev/null; then
+            echo "::error::Tag $TAG already exists"
+            exit 1
+          fi
+          gh release create "$TAG" \
+            dist/dothub-installer.exe \
+            dist/dothub-installer-x86_64.AppImage \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --generate-notes
